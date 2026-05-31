@@ -565,15 +565,43 @@ const TOPIC_META = {
   world:         { icon: '🌏', label: 'World' },
 };
 
+// These feeds are verified to work via proxy from hosted environments
 const TOPIC_FEEDS = {
-  technology:    ['https://feeds.feedburner.com/TechCrunch','https://www.theverge.com/rss/index.xml','https://www.wired.com/feed/rss'],
-  business:      ['https://feeds.bloomberg.com/markets/news.rss','https://www.economist.com/finance-and-economics/rss.xml'],
-  sports:        ['https://www.espn.com/espn/rss/news','https://feeds.bbci.co.uk/sport/rss.xml'],
-  politics:      ['https://feeds.bbci.co.uk/news/politics/rss.xml','https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml'],
-  entertainment: ['https://variety.com/feed/','https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml'],
-  science:       ['https://www.sciencedaily.com/rss/top.xml','https://feeds.bbci.co.uk/news/science_and_environment/rss.xml','https://www.nasa.gov/rss/dyn/breaking_news.rss'],
-  health:        ['https://feeds.bbci.co.uk/news/health/rss.xml','https://rss.nytimes.com/services/xml/rss/nyt/Health.xml'],
-  world:         ['https://feeds.bbci.co.uk/news/world/rss.xml','https://feeds.reuters.com/reuters/worldnews'],
+  technology:    [
+    'https://hnrss.org/frontpage',
+    'https://feeds.arstechnica.com/arstechnica/index',
+    'https://www.theverge.com/rss/index.xml',
+  ],
+  business:      [
+    'https://feeds.a.dj.com/rss/RSSMarketsMain.xml',
+    'https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines',
+    'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147',
+  ],
+  sports:        [
+    'https://www.espn.com/espn/rss/news',
+    'https://feeds.bbci.co.uk/sport/rss.xml',
+  ],
+  politics:      [
+    'https://feeds.bbci.co.uk/news/politics/rss.xml',
+    'https://thehill.com/feed/',
+  ],
+  entertainment: [
+    'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+    'https://www.hollywoodreporter.com/feed/',
+  ],
+  science:       [
+    'https://www.sciencedaily.com/rss/top.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://www.nasa.gov/rss/dyn/breaking_news.rss',
+  ],
+  health:        [
+    'https://feeds.bbci.co.uk/news/health/rss.xml',
+    'https://www.medscape.com/rss/news.xml',
+  ],
+  world:         [
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://feeds.skynews.com/feeds/rss/world.xml',
+  ],
 };
 
 // ── Init ───────────────────────────────────────
@@ -837,19 +865,101 @@ async function saveAndFetch(sendAfter = true) {
 
 async function previewOnly() { await saveAndFetch(false); }
 
-// ── RSS fetch ──────────────────────────────────
+// ── RSS fetch with multi-proxy fallback ────────
+// Tries 3 different CORS proxies in order until one works.
+// This makes it robust on hosted environments like Vercel.
 async function fetchRss(feedUrl, count) {
-  const api = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}&count=${count}`;
-  const res = await fetch(api);
-  if (!res.ok) throw new Error('Fetch failed');
+  const proxies = [
+    // Proxy 1: rss2json (works well but sometimes rate-limits)
+    () => fetchViaRss2Json(feedUrl, count),
+    // Proxy 2: allorigins — fetches raw XML which we parse ourselves
+    () => fetchViaAllOrigins(feedUrl, count),
+    // Proxy 3: corsproxy.io
+    () => fetchViaCorsProxy(feedUrl, count),
+  ];
+
+  let lastError;
+  for (const tryProxy of proxies) {
+    try {
+      const result = await tryProxy();
+      if (result && result.length > 0) return result;
+    } catch(e) {
+      lastError = e;
+    }
+  }
+  throw lastError || new Error('All proxies failed for ' + feedUrl);
+}
+
+async function fetchViaRss2Json(feedUrl, count) {
+  const api = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}&count=${count}&api_key=`;
+  const res = await fetch(api, { signal: AbortSignal.timeout(6000) });
+  if (!res.ok) throw new Error('rss2json HTTP ' + res.status);
   const data = await res.json();
-  if (data.status !== 'ok') throw new Error(data.message||'RSS error');
-  return (data.items||[]).map(item => ({
-    title: item.title,
+  if (data.status !== 'ok') throw new Error(data.message || 'rss2json error');
+  const feedName = data.feed?.title || hostname(feedUrl);
+  return (data.items || []).slice(0, count).map(item => ({
+    title: cleanText(item.title),
     url:   item.link,
-    src:   data.feed?.title || new URL(feedUrl).hostname,
+    src:   feedName,
     date:  item.pubDate,
   }));
+}
+
+async function fetchViaAllOrigins(feedUrl, count) {
+  const api = `https://api.allorigins.win/get?url=${encodeURIComponent(feedUrl)}`;
+  const res = await fetch(api, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error('allorigins HTTP ' + res.status);
+  const data = await res.json();
+  if (!data.contents) throw new Error('allorigins empty');
+  return parseRssXml(data.contents, count, feedUrl);
+}
+
+async function fetchViaCorsProxy(feedUrl, count) {
+  const api = `https://corsproxy.io/?${encodeURIComponent(feedUrl)}`;
+  const res = await fetch(api, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error('corsproxy HTTP ' + res.status);
+  const xml = await res.text();
+  return parseRssXml(xml, count, feedUrl);
+}
+
+// Parse raw RSS/Atom XML into our article format
+function parseRssXml(xml, count, feedUrl) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, 'text/xml');
+
+  // Try RSS <item> first, then Atom <entry>
+  let items = [...doc.querySelectorAll('item')];
+  if (items.length === 0) items = [...doc.querySelectorAll('entry')];
+  if (items.length === 0) throw new Error('No items in feed');
+
+  // Feed title
+  const feedTitle = doc.querySelector('channel > title, feed > title')?.textContent?.trim()
+    || hostname(feedUrl);
+
+  return items.slice(0, count).map(item => {
+    const title = item.querySelector('title')?.textContent?.trim() || 'Untitled';
+    const link  = item.querySelector('link')?.textContent?.trim()
+                  || item.querySelector('link')?.getAttribute('href')
+                  || '';
+    const date  = item.querySelector('pubDate, published, updated')?.textContent?.trim() || '';
+    return {
+      title: cleanText(title),
+      url:   link,
+      src:   feedTitle,
+      date,
+    };
+  });
+}
+
+function hostname(url) {
+  try { return new URL(url).hostname.replace('www.',''); } catch(e) { return url; }
+}
+
+function cleanText(str) {
+  // Strip HTML tags and decode entities
+  const d = document.createElement('div');
+  d.innerHTML = str;
+  return d.textContent || d.innerText || str;
 }
 
 // ── Instagram fetch ────────────────────────────
